@@ -15,7 +15,7 @@ concurrency:
 jobs:
   build:
     if: github.repository == 'LuTian001/MusicFree' && github.ref == 'refs/heads/feature/skip-intro-outro'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
       CUSTOM_APP_VERSION: 1.0.0-beta.4-skip.1
@@ -69,7 +69,7 @@ jobs:
           PY
 
       - name: Install Android SDK components
-        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'ndk;26.1.10909125'
+        run: '"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0" "ndk;26.1.10909125"'
 
       - name: Configure private release signing
         env:
