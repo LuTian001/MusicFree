@@ -5,6 +5,7 @@
 import getOrCreateMMKV from "@/utils/getOrCreateMMKV";
 import { useEffect, useState } from "react";
 import { safeParse } from "./jsonUtil";
+import type { SkipIntroOutroSettings } from "./skipIntroOutro";
 
 // Internal Method
 const getStore = () => {
@@ -24,6 +25,8 @@ interface IPersistStatus {
     "music.rate": number;
     /** 音质 */
     "music.quality": IMusic.IQualityKey;
+    /** 全局跳过片头片尾设置 */
+    "music.skipIntroOutro": SkipIntroOutroSettings;
     /** app */
     "app.skipVersion": string;
     /** 开屏弹窗 */

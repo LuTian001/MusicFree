@@ -173,6 +173,9 @@ export interface ITrackPlayer extends IInjectable, EventEmitter<{
      */
     getProgress(): Promise<Progress>;
 
+    /** Apply global intro/outro skips from a background progress event. */
+    handlePlaybackProgress(): Promise<void>;
+
     /**
      * 获取当前播放速率
      * @returns 当前播放速率

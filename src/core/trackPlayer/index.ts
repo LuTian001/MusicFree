@@ -17,6 +17,9 @@ import Network from "@/utils/network";
 import PersistStatus from "@/utils/persistStatus";
 import { getQualityOrder } from "@/utils/qualities";
 import { musicIsPaused } from "@/utils/trackUtils";
+import { normalizeSkipIntroOutroSettings } from "@/utils/skipIntroOutro";
+import type { SkipIntroOutroSettings } from "@/utils/skipIntroOutro";
+import { getSkipPlaybackWindow } from "@/utils/skipPlayback";
 import EventEmitter from "eventemitter3";
 import { produce } from "immer";
 import { atom, getDefaultStore, useAtomValue } from "jotai";
@@ -26,6 +29,7 @@ import ReactNativeTrackPlayer, {
     State,
     Track,
     TrackMetadataBase,
+    Progress,
     usePlaybackState,
     useProgress,
 } from "react-native-track-player";
@@ -47,6 +51,16 @@ const repeatModeAtom = atom<MusicRepeatMode>(MusicRepeatMode.QUEUE);
 const qualityAtom = atom<IMusic.IQualityKey>("standard");
 const playListAtom = atom<IMusic.IMusicItem[]>([]);
 
+interface SkipPlaybackSession {
+    id: number;
+    settings: SkipIntroOutroSettings;
+    introPending: boolean;
+    handlingProgress: boolean;
+    finishing: boolean;
+    playRequested: boolean;
+    prepared: boolean;
+    cancelPreparation?: () => void;
+}
 
 class TrackPlayer extends EventEmitter<{
     [TrackPlayerEvents.PlayEnd]: () => void;
@@ -67,6 +81,8 @@ class TrackPlayer extends EventEmitter<{
     private serviceInited = false;
     // 播放队列索引map
     private playListIndexMap = createMediaIndexMap([] as IMusic.IMusicItem[]);
+    private skipPlaybackId = 0;
+    private skipPlaybackSession: SkipPlaybackSession | null = null;
 
 
     private static maxMusicQueueLength = 10000;
@@ -153,6 +169,7 @@ class TrackPlayer extends EventEmitter<{
         }
 
         if (track && this.isInPlayList(track)) {
+            const session = this.beginSkipPlayback(false);
             if (!this.configService.getConfig("basic.autoPlayWhenAppStart")) {
                 track.isInit = true;
             }
@@ -164,23 +181,21 @@ class TrackPlayer extends EventEmitter<{
                     track.url = newSource?.url || track.url;
                     track.headers = newSource?.headers || track.headers;
 
-                    if (isSameMediaItem(this.currentMusic, track)) {
-                        await this.setTrackSource(track as Track, false);
-                        if (progress) {
-                            // 异步
-                            this.seekTo(progress);
-                        }
+                    if (isSameMediaItem(this.currentMusic, track) && session === this.skipPlaybackSession) {
+                        await this.setTrackSource(track as Track, false, progress ?? 0, session);
                     }
                 });
             this.setCurrentMusic(track);
-
-            if (progress) {
-                // 异步
-                this.seekTo(progress);
-            }
         }
 
         if (!this.serviceInited) {
+
+            ReactNativeTrackPlayer.addEventListener(Event.PlaybackState, evt => {
+                const session = this.skipPlaybackSession;
+                if (session && (evt.state === State.Ready || evt.state === State.Playing)) {
+                    this.rememberPreparedState(session, session.id, evt.state);
+                }
+            });
 
             /**
              * 此事件可能会被触发多次（比如直接替换queue） 参考代码：https://github.com/doublesymmetry/KotlinAudio
@@ -193,16 +208,10 @@ class TrackPlayer extends EventEmitter<{
                         evt.lastIndex === 0 &&
                         evt.track?.url === TrackPlayer.fakeAudioUrl
                     ) {
-                        trace("队列末尾，播放下一首");
-                        this.emit(TrackPlayerEvents.PlayEnd);
-                        if (
-                            this.repeatMode ===
-                            MusicRepeatMode.SINGLE
-                        ) {
-                            await this.play(null, true);
-                        } else {
-                            // 当前生效的歌曲是下一曲的标记
-                            await this.skipToNext();
+                        const session = this.skipPlaybackSession;
+                        if (evt.lastTrack?.musicfreePlaybackId === session?.id) {
+                            trace("队列末尾，播放下一首");
+                            await this.finishPlayback(session);
                         }
                     }
                 },
@@ -386,7 +395,7 @@ class TrackPlayer extends EventEmitter<{
         if (shouldPlayCurrent === true) {
             await this.play(currentMusic, true);
         } else if (shouldPlayCurrent === false) {
-            await ReactNativeTrackPlayer.reset();
+            await this.reset();
         }
     }
 
@@ -406,6 +415,16 @@ class TrackPlayer extends EventEmitter<{
             if (!musicItem) {
                 throw new Error(PlayFailReason.PLAY_LIST_IS_EMPTY);
             }
+            const sameMusic = this.isCurrentMusic(musicItem);
+            const session = forcePlay || !sameMusic
+                ? this.beginSkipPlayback(true, sameMusic && !!this.skipPlaybackSession?.prepared)
+                : this.skipPlaybackSession ?? this.beginSkipPlayback(true);
+            session.playRequested = true;
+            if (session.cancelPreparation && !forcePlay) {
+                // A resume request during preparation must still wait for the
+                // original seek-before-play operation to finish.
+                return;
+            }
             // 1. 移动网络禁止播放
             const localPath = getLocalPath(musicItem);
             if (
@@ -414,7 +433,7 @@ class TrackPlayer extends EventEmitter<{
                 !LocalMusicSheet.isLocalMusic(musicItem) &&
                 !localPath
             ) {
-                await ReactNativeTrackPlayer.reset();
+                await this.reset();
                 throw new Error(PlayFailReason.FORBID_CELLUAR_NETWORK_PLAY);
             }
 
@@ -422,30 +441,71 @@ class TrackPlayer extends EventEmitter<{
             if (this.isCurrentMusic(musicItem)) {
                 // 获取底层播放器中的track
                 const currentTrack = await ReactNativeTrackPlayer.getTrack(0);
+                if (session !== this.skipPlaybackSession) {
+                    return;
+                }
+                if (currentTrack?.url === TrackPlayer.proposedAudioUrl && !forcePlay) {
+                    // The current request is still resolving its source.
+                    return;
+                }
                 // 2.1 如果当前有源
                 if (
                     currentTrack?.url &&
+                    currentTrack.url !== TrackPlayer.proposedAudioUrl &&
+                    currentTrack.url !== TrackPlayer.fakeAudioUrl &&
                     isSameMediaItem(
                         musicItem,
                         currentTrack as IMusic.IMusicItem,
                     )
                 ) {
+                    if (session.introPending) {
+                        await this.rememberPreparedState(session, currentTrack.musicfreePlaybackId);
+                        await ReactNativeTrackPlayer.pause();
+                        if (session !== this.skipPlaybackSession) {
+                            return;
+                        }
+                    }
                     const currentActiveIndex =
                         await ReactNativeTrackPlayer.getActiveTrackIndex();
                     if (currentActiveIndex !== 0) {
                         await ReactNativeTrackPlayer.skip(0);
                     }
-                    if (forcePlay) {
-                        // 2.1.1 强制重新开始
-                        await this.seekTo(0);
+                    await this.waitForTrackReady(session);
+                    if (session !== this.skipPlaybackSession) {
+                        return;
                     }
                     const currentState = (
                         await ReactNativeTrackPlayer.getPlaybackState()
                     ).state;
                     if (currentState === State.Stopped) {
-                        await this.setTrackSource(currentTrack);
+                        const currentProgress = await ReactNativeTrackPlayer.getProgress();
+                        await this.setTrackSource(currentTrack, false,
+                            forcePlay ? undefined : currentProgress.position, session);
+                    } else {
+                        if (currentTrack.musicfreePlaybackId !== session.id) {
+                            const metadata: Track = {
+                                url: currentTrack.url,
+                                musicfreePlaybackId: session.id,
+                            };
+                            await ReactNativeTrackPlayer.updateMetadataForTrack(0, metadata);
+                        }
+                        const currentProgress = await ReactNativeTrackPlayer.getProgress();
+                        if (session !== this.skipPlaybackSession) {
+                            return;
+                        }
+                        if (forcePlay) {
+                            // Replaying the current audio starts at its intro
+                            // offset directly, without briefly seeking to zero.
+                            const { introSeconds } = getSkipPlaybackWindow(this.getEnabledSkipSettings(session), currentProgress.duration);
+                            await this.seekTo(introSeconds);
+                            if (Number.isFinite(currentProgress.duration) && currentProgress.duration > 0) {
+                                session.introPending = false;
+                            }
+                        } else {
+                            await this.applyIntro(session, currentProgress);
+                        }
                     }
-                    if (currentState !== State.Playing) {
+                    if (currentState !== State.Playing && session === this.skipPlaybackSession && session.playRequested) {
                         // 2.1.2 恢复播放
                         await ReactNativeTrackPlayer.play();
                     }
@@ -575,7 +635,7 @@ class TrackPlayer extends EventEmitter<{
 
             trace("获取音源成功", track);
             // 9. 设置音源
-            await this.setTrackSource(track as Track);
+            await this.setTrackSource(track as Track, true, undefined, session);
 
             // 10. 获取补充信息
             let info: Partial<IMusic.IMusicItem> | null = null;
@@ -625,6 +685,14 @@ class TrackPlayer extends EventEmitter<{
     }
 
     async pause(): Promise<void> {
+        const session = this.skipPlaybackSession;
+        if (session) {
+            session.playRequested = false;
+            await this.rememberPreparedState(session);
+            if (session !== this.skipPlaybackSession) {
+                return;
+            }
+        }
         await ReactNativeTrackPlayer.pause();
     }
 
@@ -637,7 +705,7 @@ class TrackPlayer extends EventEmitter<{
         this.setPlayList([]);
         this.setCurrentMusic(null);
 
-        await ReactNativeTrackPlayer.reset();
+        await this.reset();
         PersistStatus.set("music.musicItem", undefined);
         PersistStatus.set("music.progress", 0);
     }
@@ -671,6 +739,7 @@ class TrackPlayer extends EventEmitter<{
 
         // 获取当前歌曲
         const musicItem = this.currentMusic;
+        const session = this.skipPlaybackSession;
         if (!musicItem) {
             return false;
         }
@@ -684,16 +753,16 @@ class TrackPlayer extends EventEmitter<{
             if (!newSource?.url) {
                 throw new Error(PlayFailReason.INVALID_SOURCE);
             }
-            if (this.isCurrentMusic(musicItem)) {
+            if (this.isCurrentMusic(musicItem) && session === this.skipPlaybackSession) {
                 const playingState = (
                     await ReactNativeTrackPlayer.getPlaybackState()
                 ).state;
                 await this.setTrackSource(
                     this.mergeTrackSource(musicItem, newSource) as unknown as Track,
                     !musicIsPaused(playingState),
+                    progress.position ?? 0,
+                    session,
                 );
-
-                await this.seekTo(progress.position ?? 0);
                 this.setQuality(newQuality);
             }
             return true;
@@ -738,7 +807,65 @@ class TrackPlayer extends EventEmitter<{
     getProgress = ReactNativeTrackPlayer.getProgress;
     getRate = ReactNativeTrackPlayer.getRate;
     setRate = ReactNativeTrackPlayer.setRate;
-    reset = ReactNativeTrackPlayer.reset;
+    reset = async () => {
+        // PlayEnd listeners may reset the player to close the app. Invalidate
+        // synchronously, so the ending track cannot start another audio.
+        this.skipPlaybackSession?.cancelPreparation?.();
+        this.skipPlaybackSession = null;
+        await ReactNativeTrackPlayer.reset();
+    };
+
+    async handlePlaybackProgress(): Promise<void> {
+        const session = this.skipPlaybackSession;
+        if (!session) {
+            return;
+        }
+        const settings = this.getEnabledSkipSettings(session);
+        if (
+            session.handlingProgress || session.finishing ||
+            (!session.introPending && (!settings.outroEnabled || settings.outroSeconds === 0))
+        ) {
+            return;
+        }
+        session.handlingProgress = true;
+        try {
+            // Read fresh native state: a queued progress event can belong to a
+            // previous audio, even though both audios use queue index zero.
+            const [track, progress, playbackState] = await Promise.all([
+                ReactNativeTrackPlayer.getActiveTrack(),
+                ReactNativeTrackPlayer.getProgress(),
+                ReactNativeTrackPlayer.getPlaybackState(),
+            ]);
+            if (
+                session !== this.skipPlaybackSession ||
+                track?.musicfreePlaybackId !== session.id ||
+                track?.url === TrackPlayer.fakeAudioUrl ||
+                track?.url === TrackPlayer.proposedAudioUrl ||
+                playbackState.state !== State.Playing
+            ) {
+                return;
+            }
+            if (session.introPending) {
+                await this.applyIntro(session, progress);
+                if (session !== this.skipPlaybackSession || session.introPending) {
+                    return;
+                }
+                // Use a fresh position on the next tick after seeking.
+                if (getSkipPlaybackWindow(this.getEnabledSkipSettings(session), progress.duration).introSeconds > progress.position) {
+                    return;
+                }
+            }
+            const { outroStart } = getSkipPlaybackWindow(this.getEnabledSkipSettings(session), progress.duration);
+            if (outroStart !== null && Number.isFinite(progress.position) && progress.position >= outroStart) {
+                await this.finishPlayback(session, true);
+            }
+        } catch {
+            // The native queue may disappear while seeking or closing. The next
+            // progress event can retry if this playback is still current.
+        } finally {
+            session.handlingProgress = false;
+        }
+    }
 
 
     /**************** 辅助函数 -- 设置内部状态 ****************/
@@ -746,6 +873,8 @@ class TrackPlayer extends EventEmitter<{
     private setCurrentMusic(musicItem?: IMusic.IMusicItem | null) {
         // 设置UI内部状态的musicitem
         if (!musicItem) {
+            this.skipPlaybackSession?.cancelPreparation?.();
+            this.skipPlaybackSession = null;
             this.currentIndex = -1;
             getDefaultStore().set(currentMusicAtom, null);
             PersistStatus.set("music.musicItem", undefined);
@@ -797,16 +926,194 @@ class TrackPlayer extends EventEmitter<{
     }
 
     // 设置音源
-    private async setTrackSource(track: Track, autoPlay = true) {
+    private async setTrackSource(
+        track: Track,
+        autoPlay = true,
+        startPosition?: number,
+        session = this.skipPlaybackSession,
+    ) {
         const clonedTrack = this.patchMediaArtwork(track);
-        if (!clonedTrack) {
+        if (!clonedTrack || !session || session !== this.skipPlaybackSession) {
             return;
         }
-        await ReactNativeTrackPlayer.setQueue([clonedTrack, this.getFakeNextTrack()]);
+        // A quality/source replacement must not inherit readiness from the
+        // previous native queue, even when it is the same logical audio.
+        session.prepared = false;
+        session.id = ++this.skipPlaybackId;
+        if (session.introPending) {
+            // Replacing an already-playing queue can retain playWhenReady.
+            // Keep the new audio silent until its starting position is set.
+            await ReactNativeTrackPlayer.pause();
+            if (session !== this.skipPlaybackSession) {
+                return;
+            }
+        }
+        await ReactNativeTrackPlayer.setQueue([
+            { ...clonedTrack, musicfreePlaybackId: session.id },
+            this.getFakeNextTrack(),
+        ]);
+        if (session !== this.skipPlaybackSession) {
+            return;
+        }
         PersistStatus.set("music.musicItem", track as IMusic.IMusicItem);
         PersistStatus.set("music.progress", 0);
-        if (autoPlay) {
+        if (startPosition !== undefined) {
+            session.introPending = false;
+            await this.seekTo(startPosition);
+        } else {
+            await this.waitForTrackReady(session);
+            if (session !== this.skipPlaybackSession) {
+                return;
+            }
+            await this.applyIntro(session, await ReactNativeTrackPlayer.getProgress());
+        }
+        if (autoPlay && session === this.skipPlaybackSession && session.playRequested) {
             await ReactNativeTrackPlayer.play();
+        }
+    }
+
+    private beginSkipPlayback(skipIntro: boolean, prepared = false): SkipPlaybackSession {
+        this.skipPlaybackSession?.cancelPreparation?.();
+        const settings = normalizeSkipIntroOutroSettings(PersistStatus.get("music.skipIntroOutro"));
+        const session = {
+            id: ++this.skipPlaybackId,
+            settings,
+            introPending: skipIntro && settings.introEnabled && settings.introSeconds > 0,
+            handlingProgress: false,
+            finishing: false,
+            playRequested: skipIntro,
+            prepared,
+        };
+        this.skipPlaybackSession = session;
+        return session;
+    }
+
+    private async rememberPreparedState(
+        session: SkipPlaybackSession,
+        nativePlaybackId = session.id,
+        eventState?: State,
+    ) {
+        const playbackId = session.id;
+        try {
+            const [track, { state }] = await Promise.all([
+                ReactNativeTrackPlayer.getActiveTrack(),
+                ReactNativeTrackPlayer.getPlaybackState(),
+            ]);
+            if (
+                session !== this.skipPlaybackSession || session.id !== playbackId ||
+                track?.musicfreePlaybackId !== nativePlaybackId ||
+                track?.url === TrackPlayer.fakeAudioUrl || track?.url === TrackPlayer.proposedAudioUrl
+            ) {
+                return;
+            }
+            if (
+                state === State.Ready || state === State.Playing ||
+                (state === State.Paused && (eventState === State.Ready || eventState === State.Playing))
+            ) {
+                session.prepared = true;
+                session.cancelPreparation?.();
+            }
+        } catch {
+            // Queue changes can invalidate this observation.
+        }
+    }
+
+    private async waitForTrackReady(session: SkipPlaybackSession) {
+        if (!session.introPending || session.prepared || session !== this.skipPlaybackSession) {
+            return;
+        }
+        // Loading duration zero differs from a prepared stream whose duration
+        // is genuinely unknown. Wait for native preparation, without a timer.
+        await new Promise<void>(resolve => {
+            let completed = false;
+            const finish = () => {
+                if (completed) {
+                    return;
+                }
+                completed = true;
+                subscription.remove();
+                session.cancelPreparation = undefined;
+                resolve();
+            };
+            const checkState = async () => {
+                try {
+                    const { state } = await ReactNativeTrackPlayer.getPlaybackState();
+                    if (session !== this.skipPlaybackSession) {
+                        finish();
+                    } else if (state === State.Ready || state === State.Playing) {
+                        session.prepared = true;
+                        finish();
+                    } else if (state === State.Error || state === State.Stopped || state === State.Ended) {
+                        session.playRequested = false;
+                        finish();
+                    } else if (state === State.Paused) {
+                        // Paused can be emitted while native preparation is
+                        // still pending; zero duration does not prove readiness.
+                        const { duration } = await ReactNativeTrackPlayer.getProgress();
+                        if (session !== this.skipPlaybackSession || (Number.isFinite(duration) && duration > 0)) {
+                            if (session === this.skipPlaybackSession) {
+                                session.prepared = true;
+                            }
+                            finish();
+                        }
+                    }
+                } catch {
+                    if (session === this.skipPlaybackSession) {
+                        session.playRequested = false;
+                    }
+                    if (!completed) {
+                        finish();
+                    }
+                }
+            };
+            const subscription = ReactNativeTrackPlayer.addEventListener(Event.PlaybackState, checkState);
+            session.cancelPreparation = finish;
+            checkState();
+        });
+    }
+
+    private async applyIntro(session: SkipPlaybackSession, progress: Progress) {
+        if (
+            session !== this.skipPlaybackSession || !session.introPending ||
+            !Number.isFinite(progress.duration) || progress.duration <= 0
+        ) {
+            return;
+        }
+        const { introSeconds } = getSkipPlaybackWindow(this.getEnabledSkipSettings(session), progress.duration);
+        if (introSeconds > progress.position) {
+            await this.seekTo(introSeconds);
+        }
+        session.introPending = false;
+    }
+
+    private getEnabledSkipSettings(session: SkipPlaybackSession): SkipIntroOutroSettings {
+        const current = normalizeSkipIntroOutroSettings(PersistStatus.get("music.skipIntroOutro"));
+        return {
+            ...session.settings,
+            introEnabled: session.settings.introEnabled && current.introEnabled,
+            outroEnabled: session.settings.outroEnabled && current.outroEnabled,
+        };
+    }
+
+    private async finishPlayback(session: SkipPlaybackSession | null, skipOutro = false) {
+        if (!session || session !== this.skipPlaybackSession || session.finishing) {
+            return;
+        }
+        session.finishing = true;
+        try {
+            this.emit(TrackPlayerEvents.PlayEnd);
+            if (session !== this.skipPlaybackSession) {
+                return;
+            }
+            if (!skipOutro && this.repeatMode === MusicRepeatMode.SINGLE) {
+                await this.play(null, true);
+            } else {
+                await this.skipToNext();
+            }
+        } finally {
+            if (session === this.skipPlaybackSession) {
+                session.finishing = false;
+            }
         }
     }
 

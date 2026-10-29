@@ -15,6 +15,7 @@ import SheetTags from "./sheetTags";
 import SimpleInput from "./simpleInput";
 import SimpleSelect from "./simpleSelect";
 import TimingClose from "./timingClose";
+import SkipIntroOutro from "./skipIntroOutro";
 import ImageViewer from "./imageViewer";
 import MusicComment from "./musicComment";
 import MusicItemLyricOptions from "./musicItemLyricOptions";
@@ -37,6 +38,8 @@ export default {
     SimpleInput,
     /** 定时关闭 */
     TimingClose,
+    /** 跳过片头片尾 */
+    SkipIntroOutro,
     /** 音质选择 */
     MusicQuality,
     /** 播放速度 */

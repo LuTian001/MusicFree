@@ -59,6 +59,20 @@ export default function MusicItemOptions(props: IMusicItemOptionsProps) {
     const downloaded = LocalMusicSheet.isLocalMusic(musicItem);
     const associatedLrc = getMediaExtraProperty(musicItem, "associatedLrc");
 
+    const commentOption: IOption = {
+        icon: "chat-bubble-oval-left-ellipsis",
+        title: t("panel.musicItemOptions.readComment"),
+        show: !!pluginManager.getByMedia(musicItem)?.supportedMethods.has("getMusicComments"),
+        onPress: () => {
+            if (!musicItem) {
+                return;
+            }
+            showPanel("MusicComment", {
+                musicItem: musicItem,
+            });
+        },
+    };
+
     const options: IOption[] = [
         {
             icon: "identification",
@@ -173,19 +187,7 @@ export default function MusicItemOptions(props: IMusicItemOptionsProps) {
                 hidePanel();
             },
         },
-        {
-            icon: "chat-bubble-oval-left-ellipsis",
-            title: t("panel.musicItemOptions.readComment"),
-            show: !!pluginManager.getByMedia(musicItem)?.supportedMethods.has("getMusicComments"),
-            onPress: () => {
-                if (!musicItem) {
-                    return;
-                }
-                showPanel("MusicComment", {
-                    musicItem: musicItem,
-                });
-            },
-        },
+        ...(from === ROUTE_PATH.MUSIC_DETAIL ? [] : [commentOption]),
         {
             icon: "link",
             title: associatedLrc
@@ -223,6 +225,15 @@ export default function MusicItemOptions(props: IMusicItemOptionsProps) {
                 showPanel("TimingClose");
             },
         },
+        {
+            icon: "motion-play",
+            title: t("panel.musicItemOptions.skipIntroOutro"),
+            show: from === ROUTE_PATH.MUSIC_DETAIL,
+            onPress: () => {
+                showPanel("SkipIntroOutro");
+            },
+        },
+        ...(from === ROUTE_PATH.MUSIC_DETAIL ? [commentOption] : []),
         {
             icon: "archive-box-x-mark",
             title: t("panel.musicItemOptions.clearPluginCache"),

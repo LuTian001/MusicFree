@@ -57,6 +57,7 @@ module.exports = async function () {
 
     RNTrackPlayer.addEventListener(Event.PlaybackProgressUpdated, evt => {
         PersistStatus.set("music.progress", evt.position);
+        TrackPlayer.handlePlaybackProgress();
     });
 
     RNTrackPlayer.addEventListener(Event.RemoteStop, async () => {
