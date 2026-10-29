@@ -486,6 +486,7 @@ export interface ILanguageData {
     "panel.musicItemOptions.unassociateLyric": string; // 解除关联歌词    
     "panel.musicItemOptions.unassociateLyricSuccess": string; // 已解除关联歌词
     "panel.musicItemOptions.timingClose": string; // 定时关闭
+    "panel.musicItemOptions.skipIntroOutro": string; // 跳过片头片尾
     "panel.musicItemOptions.clearPluginCache": string; // 清除插件缓存
     "panel.musicItemOptions.cacheCleared": string; // 缓存已清除
     "panel.musicItemOptions.deleteFailed": string; // 删除失败
@@ -519,6 +520,12 @@ export interface ILanguageData {
     "panel.timingClose.customize": string; // 自定义
     "panel.timingClose.cancelScheduleClose": string; // 取消定时关闭
     "panel.timingClose.closeAfterPlay": string; // 播放完歌曲再关闭
+
+    // 面板相关 - 跳过片头片尾
+    "panel.skipIntroOutro.introTime": string; // 设置片头时间
+    "panel.skipIntroOutro.outroTime": string; // 设置片尾时间
+    "panel.skipIntroOutro.seconds": string; // 秒
+    "panel.skipIntroOutro.hint": string; // 全局设置及开关说明
 
     // 面板相关 - 播放速度
     "panel.playRate.title": string; // 播放速度
