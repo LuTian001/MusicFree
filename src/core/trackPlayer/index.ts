@@ -58,6 +58,7 @@ interface SkipPlaybackSession {
     handlingProgress: boolean;
     finishing: boolean;
     playRequested: boolean;
+    prepared: boolean;
     cancelPreparation?: () => void;
 }
 
@@ -188,6 +189,13 @@ class TrackPlayer extends EventEmitter<{
         }
 
         if (!this.serviceInited) {
+
+            ReactNativeTrackPlayer.addEventListener(Event.PlaybackState, evt => {
+                const session = this.skipPlaybackSession;
+                if (session && (evt.state === State.Ready || evt.state === State.Playing)) {
+                    this.rememberPreparedState(session, session.id, evt.state);
+                }
+            });
 
             /**
              * 此事件可能会被触发多次（比如直接替换queue） 参考代码：https://github.com/doublesymmetry/KotlinAudio
@@ -407,8 +415,9 @@ class TrackPlayer extends EventEmitter<{
             if (!musicItem) {
                 throw new Error(PlayFailReason.PLAY_LIST_IS_EMPTY);
             }
-            const session = forcePlay || !this.isCurrentMusic(musicItem)
-                ? this.beginSkipPlayback(true)
+            const sameMusic = this.isCurrentMusic(musicItem);
+            const session = forcePlay || !sameMusic
+                ? this.beginSkipPlayback(true, sameMusic && !!this.skipPlaybackSession?.prepared)
                 : this.skipPlaybackSession ?? this.beginSkipPlayback(true);
             session.playRequested = true;
             if (session.cancelPreparation && !forcePlay) {
@@ -450,6 +459,7 @@ class TrackPlayer extends EventEmitter<{
                     )
                 ) {
                     if (session.introPending) {
+                        await this.rememberPreparedState(session, currentTrack.musicfreePlaybackId);
                         await ReactNativeTrackPlayer.pause();
                         if (session !== this.skipPlaybackSession) {
                             return;
@@ -675,8 +685,13 @@ class TrackPlayer extends EventEmitter<{
     }
 
     async pause(): Promise<void> {
-        if (this.skipPlaybackSession) {
-            this.skipPlaybackSession.playRequested = false;
+        const session = this.skipPlaybackSession;
+        if (session) {
+            session.playRequested = false;
+            await this.rememberPreparedState(session);
+            if (session !== this.skipPlaybackSession) {
+                return;
+            }
         }
         await ReactNativeTrackPlayer.pause();
     }
@@ -921,6 +936,10 @@ class TrackPlayer extends EventEmitter<{
         if (!clonedTrack || !session || session !== this.skipPlaybackSession) {
             return;
         }
+        // A quality/source replacement must not inherit readiness from the
+        // previous native queue, even when it is the same logical audio.
+        session.prepared = false;
+        session.id = ++this.skipPlaybackId;
         if (session.introPending) {
             // Replacing an already-playing queue can retain playWhenReady.
             // Keep the new audio silent until its starting position is set.
@@ -953,7 +972,7 @@ class TrackPlayer extends EventEmitter<{
         }
     }
 
-    private beginSkipPlayback(skipIntro: boolean): SkipPlaybackSession {
+    private beginSkipPlayback(skipIntro: boolean, prepared = false): SkipPlaybackSession {
         this.skipPlaybackSession?.cancelPreparation?.();
         const settings = normalizeSkipIntroOutroSettings(PersistStatus.get("music.skipIntroOutro"));
         const session = {
@@ -963,13 +982,44 @@ class TrackPlayer extends EventEmitter<{
             handlingProgress: false,
             finishing: false,
             playRequested: skipIntro,
+            prepared,
         };
         this.skipPlaybackSession = session;
         return session;
     }
 
+    private async rememberPreparedState(
+        session: SkipPlaybackSession,
+        nativePlaybackId = session.id,
+        eventState?: State,
+    ) {
+        const playbackId = session.id;
+        try {
+            const [track, { state }] = await Promise.all([
+                ReactNativeTrackPlayer.getActiveTrack(),
+                ReactNativeTrackPlayer.getPlaybackState(),
+            ]);
+            if (
+                session !== this.skipPlaybackSession || session.id !== playbackId ||
+                track?.musicfreePlaybackId !== nativePlaybackId ||
+                track?.url === TrackPlayer.fakeAudioUrl || track?.url === TrackPlayer.proposedAudioUrl
+            ) {
+                return;
+            }
+            if (
+                state === State.Ready || state === State.Playing ||
+                (state === State.Paused && (eventState === State.Ready || eventState === State.Playing))
+            ) {
+                session.prepared = true;
+                session.cancelPreparation?.();
+            }
+        } catch {
+            // Queue changes can invalidate this observation.
+        }
+    }
+
     private async waitForTrackReady(session: SkipPlaybackSession) {
-        if (!session.introPending || session !== this.skipPlaybackSession) {
+        if (!session.introPending || session.prepared || session !== this.skipPlaybackSession) {
             return;
         }
         // Loading duration zero differs from a prepared stream whose duration
@@ -988,7 +1038,10 @@ class TrackPlayer extends EventEmitter<{
             const checkState = async () => {
                 try {
                     const { state } = await ReactNativeTrackPlayer.getPlaybackState();
-                    if (session !== this.skipPlaybackSession || state === State.Ready || state === State.Playing) {
+                    if (session !== this.skipPlaybackSession) {
+                        finish();
+                    } else if (state === State.Ready || state === State.Playing) {
+                        session.prepared = true;
                         finish();
                     } else if (state === State.Error || state === State.Stopped || state === State.Ended) {
                         session.playRequested = false;
@@ -998,6 +1051,9 @@ class TrackPlayer extends EventEmitter<{
                         // still pending; zero duration does not prove readiness.
                         const { duration } = await ReactNativeTrackPlayer.getProgress();
                         if (session !== this.skipPlaybackSession || (Number.isFinite(duration) && duration > 0)) {
+                            if (session === this.skipPlaybackSession) {
+                                session.prepared = true;
+                            }
                             finish();
                         }
                     }

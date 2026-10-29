@@ -429,3 +429,93 @@ test("resuming during preparation still waits for ready before seeking and playi
     expect(native.play).toHaveBeenCalledTimes(1);
     expect(state.events.state).toBeUndefined();
 });
+
+test.each([false, true])("an already prepared unknown stream can resume with force=%s without another ready event", async force => {
+    await player.play(audio("a", 0));
+    expect(native.play).toHaveBeenCalledTimes(1);
+    await player.pause();
+    expect(state.playbackState).toBe("paused");
+    const resuming = player.play(null, force);
+    let completed = false;
+    resuming.then(() => { completed = true; });
+    await flushPromises();
+    expect(completed).toBe(true);
+    await resuming;
+    expect(native.play).toHaveBeenCalledTimes(2);
+    expect(state.events.state).toBeUndefined();
+});
+
+test("a new audio still waits for its own ready state after an unknown stream", async () => {
+    await player.play(audio("a", 0));
+    delayAudioPreparation("b");
+    const nextAudio = player.play(audio("b"));
+    await flushPromises();
+    expect(native.play).toHaveBeenCalledTimes(1);
+    expect(state.events.state).toEqual(expect.any(Function));
+    state.duration = 160;
+    state.playbackState = "ready";
+    state.events.state({ state: "ready" });
+    await nextAudio;
+    expect(player.currentMusic.id).toBe("b");
+    expect(state.actions.slice(-3)).toEqual(["queue", "seek:30", "play"]);
+    expect(native.play).toHaveBeenCalledTimes(2);
+});
+
+test("enabling intro for a prepared unknown stream does not block a forced replay", async () => {
+    values["music.skipIntroOutro"] = { ...enabled, introEnabled: false };
+    await player.play(audio("a", 0));
+    await player.pause();
+    values["music.skipIntroOutro"] = { ...enabled };
+    const replaying = player.play(null, true);
+    let completed = false;
+    replaying.then(() => { completed = true; });
+    await flushPromises();
+    expect(completed).toBe(true);
+    await replaying;
+    expect(native.play).toHaveBeenCalledTimes(2);
+    expect(state.position).toBe(0);
+    expect(state.events.state).toBeUndefined();
+});
+
+test("a ready event releases unknown-stream preparation even if native is already paused", async () => {
+    await player.setupTrackPlayer();
+    const observeReady = state.events.state;
+    delayAudioPreparation();
+    const preparing = player.play(audio("a", 0));
+    await flushPromises();
+    expect(native.play).not.toHaveBeenCalled();
+    state.playbackState = "paused";
+    observeReady({ state: "ready" });
+    let completed = false;
+    preparing.then(() => { completed = true; });
+    await flushPromises();
+    expect(completed).toBe(true);
+    await preparing;
+    expect(native.play).toHaveBeenCalledTimes(1);
+    expect(native.seekTo).not.toHaveBeenCalled();
+});
+
+test("a restored unknown stream can force replay after its ready event without another event", async () => {
+    const track = audio("a", 0);
+    values["music.playList"] = [track];
+    values["music.musicItem"] = track;
+    values["music.progress"] = 12;
+    values["music.skipIntroOutro"] = { ...enabled, introEnabled: false };
+    await player.setupTrackPlayer();
+    const observeReady = state.events.state;
+    await flushPromises();
+    expect(state.position).toBe(12);
+    expect(native.play).not.toHaveBeenCalled();
+    state.playbackState = "paused";
+    observeReady({ state: "ready" });
+    await flushPromises();
+    values["music.skipIntroOutro"] = { ...enabled };
+    const replaying = player.play(null, true);
+    let completed = false;
+    replaying.then(() => { completed = true; });
+    await flushPromises();
+    expect(completed).toBe(true);
+    await replaying;
+    expect(native.play).toHaveBeenCalledTimes(1);
+    expect(state.position).toBe(0);
+});
